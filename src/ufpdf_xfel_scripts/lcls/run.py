@@ -226,9 +226,28 @@ class Run:
         Is_avg_off_mon1 = []
         Is_avg_on_mon2 = []
         Is_avg_off_mon2 = []
+
+        valid_delays = []
+
         for ud in self.unique_delays:
             mask_on = (self.delays == ud) & self.laser_mask
             mask_off = (self.delays == ud) & ~self.laser_mask
+
+            # Check on/off pairs and skip if missing
+            n_total = int(np.sum(self.delays == ud))
+            n_on = int(np.sum(mask_on))
+            n_off = int(np.sum(mask_off))
+
+            if (n_on == 0) or (n_off == 0):
+                if self.verbose:
+                    print(
+                        f"[DBG] excluding delay={ud} due to missing pair:"
+                        f"total={n_total} on={n_on} off={n_off}"
+                    )
+                continue
+
+            valid_delays.append(ud)
+
             Is_avg_on.append(np.nanmean(self._Is_raw[mask_on], axis=0))
             Is_avg_off.append(np.nanmean(self._Is_raw[mask_off], axis=0))
             Is_avg_on_mon1.append(
@@ -259,6 +278,10 @@ class Run:
                     axis=0,
                 )
             )
+
+        self.unique_delays = np.asarray(
+            valid_delays
+        )  # filter down to valid delay pairs
 
         self.raw_delays = {}
         for i, step in enumerate(self.unique_delays):
