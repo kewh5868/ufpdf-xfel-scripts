@@ -76,6 +76,20 @@ class Run:
     verbose : bool
         The verbosity for debugging and assessing (default, False, is
         low verbosity).
+    filtering : bool
+        If True, apply filter after loading and before reduction
+        (default True).
+    diode_mean_frac_cutoff : float
+        Drop diode values <= this fraction of the mean of nonzero diode
+        values (default 0.10).
+    diode_low_quantile_drop : float or None
+        Drop the lowest fraction of remaining diode values after mean
+        cutoff (default 0.05, None disables).
+    jitter_low_cutoff : float
+        Drop time jitter values >= this fraction of max(time jitter)
+        (default 0.20).
+    jitter_floor_cutoff : float
+        Histogram cutoff floor as fraction of peak bin count (default 0.05).
 
     Attributes
     ----------
@@ -134,6 +148,11 @@ class Run:
         fit_qmax=12,
         pdf_rmin=0,
         pdf_rmax=60,
+        filtering=True,
+        diode_mean_frac_cutoff=0.10,
+        diode_low_quantile_drop=0.05,
+        jitter_low_cutoff=0.20,
+        jitter_floor_cutoff=0.05,
     ):
         # --- store run-level metadata ---
         self.run_number = run_number
@@ -168,8 +187,17 @@ class Run:
         }
         self.points_away_t0_plot_on_off = points_away_t0_plot_on_off
 
+        # --- filtering defaults ---
+        self.filtering = filtering
+        self.diode_mean_frac_cutoff = diode_mean_frac_cutoff
+        self.diode_low_quantile_drop = diode_low_quantile_drop
+        self.jitter_low_cutoff = jitter_low_cutoff
+        self.jitter_floor_cutoff = jitter_floor_cutoff
+
         # --- run the reduction pipeline ---
         self._load()
+        if self.filtering:
+            self._filter()
         self._reduce()
         self._morph()
         try:
@@ -485,6 +513,7 @@ class Run:
             Is_raw = np.nanmean(Is_raw, axis=1)
             monitor1 = np.asarray(f["MfxDg1BmMon/totalIntensityJoules"][:])
             monitor2 = np.asarray(f["MfxDg2BmMon/totalIntensityJoules"][:])
+            time_jitter = np.asarray(f["/tt/fltpos_ps"][:])
 
             self.delay_scan = (
                 "scan" in f
@@ -512,7 +541,117 @@ class Run:
         self.darks = Is_raw[~xray_mask].copy()
         self.delays = delays[xray_mask].copy()
         self.laser_mask = laser_mask[xray_mask].copy()
+        self.time_jitter = time_jitter[xray_mask].copy()
         return
+
+    def _filter(self):
+        """Filter shots using monitor2 (diode) and time_jitter
+        metadata."""
+        if self._Is_raw is None or self.monitor2 is None:
+            return
+        if self.monitor1 is None or self.laser_mask is None:
+            return
+
+        # filter 1: monitor2 (diode), drop low-intensity shots via mean-frac
+        # cutoff and optional low-quantile drop after nonfinite and zeros.
+        diode_values = self.monitor2
+        diode_mean_frac_cutoff = float(self.diode_mean_frac_cutoff)
+        diode_low_quantile_drop = self.diode_low_quantile_drop
+        if diode_mean_frac_cutoff < 0.0:
+            raise ValueError("diode_mean_frac_cutoff must be >= 0.")
+
+        keep_diode_mask = np.isfinite(diode_values)
+        keep_diode_mask &= diode_values != 0.0
+        nonzero_diode_values = diode_values[keep_diode_mask]
+        diode_nonzero_mean = None
+        diode_mean_threshold = None
+        if nonzero_diode_values.size:
+            diode_nonzero_mean = float(nonzero_diode_values.mean())
+            diode_mean_threshold = diode_mean_frac_cutoff * diode_nonzero_mean
+            keep_diode_mask &= diode_values > diode_mean_threshold
+
+        diode_low_quantile = None
+        diode_low_quantile_cutoff = None
+        if diode_low_quantile_drop is not None:
+            diode_low_quantile = float(diode_low_quantile_drop)
+            if not (0.0 < diode_low_quantile < 1.0):
+                raise ValueError("diode_low_quantile_drop in (0, 1).")
+
+            diode_remaining_values = diode_values[keep_diode_mask]
+            if diode_remaining_values.size:
+                diode_low_quantile_cutoff = float(
+                    np.quantile(diode_remaining_values, diode_low_quantile)
+                )
+                keep_diode_mask &= diode_values >= diode_low_quantile_cutoff
+
+        self._Is_raw = self._Is_raw[keep_diode_mask, :].copy()
+        self.monitor1 = self.monitor1[keep_diode_mask].copy()
+        self.monitor2 = self.monitor2[keep_diode_mask].copy()
+        self.laser_mask = self.laser_mask[keep_diode_mask].copy()
+        if self.time_jitter is not None:
+            self.time_jitter = self.time_jitter[keep_diode_mask].copy()
+        if bool(self.delay_scan) and self.delays is not None:
+            self.delays = self.delays[keep_diode_mask].copy()
+        if self.time_jitter is None:
+            return
+
+        # filter 2: time_jitter, drop high-offset shots using histogram cutoff.
+        # Cutoff triggers at near-zero max-fraction or peak-bin floor fraction.
+        time_filter_nbins = int(getattr(self, "time_filter_nbins", 100))
+        time_filter_smooth_bins = int(
+            getattr(self, "time_filter_smooth_bins", 5)
+        )
+        jitter_low_cutoff = float(self.jitter_low_cutoff)
+        jitter_floor_cutoff = float(self.jitter_floor_cutoff)
+        time_filter_nbins = max(10, time_filter_nbins)
+        time_filter_smooth_bins = max(1, time_filter_smooth_bins)
+        if not (0.0 < jitter_low_cutoff < 1.0):
+            jitter_low_cutoff = 0.20
+        if not (0.0 < jitter_floor_cutoff < 1.0):
+            jitter_floor_cutoff = 0.05
+
+        time_offsets_ps = self.time_jitter
+        finite_time_mask = np.isfinite(time_offsets_ps)
+        if int(finite_time_mask.sum()) == 0:
+            if self.verbose:
+                print("[DBG] _filter time: no finite time_jitter, skipping")
+            return
+
+        finite_time_offsets = time_offsets_ps[finite_time_mask]
+        max_time_ps = float(finite_time_offsets.max())
+        jitter_low_limit = jitter_low_cutoff * max_time_ps
+
+        hist_counts, hist_edges = np.histogram(
+            finite_time_offsets,
+            bins=time_filter_nbins,
+        )
+        smooth_kernel = np.ones(time_filter_smooth_bins, dtype=float)
+        smooth_kernel /= float(time_filter_smooth_bins)
+        smooth_counts = np.convolve(
+            hist_counts.astype(float),
+            smooth_kernel,
+            mode="same",
+        )
+
+        peak_bin = int(np.argmax(smooth_counts))
+        peak_count = float(smooth_counts[peak_bin])
+        jitter_floor_count = jitter_floor_cutoff * peak_count
+        bin_centers = 0.5 * (hist_edges[:-1] + hist_edges[1:])
+        below_floor = smooth_counts < jitter_floor_count
+        beyond_limit = bin_centers >= jitter_low_limit
+        fail_mask = below_floor | beyond_limit
+        fail_mask[:peak_bin] = False
+        first_fail_bin = int(np.argmax(fail_mask))
+        cutoff_time_ps = float(hist_edges[first_fail_bin])
+        keep_time_mask = finite_time_mask & (time_offsets_ps < cutoff_time_ps)
+
+        self._Is_raw = self._Is_raw[keep_time_mask, :].copy()
+        self.monitor1 = self.monitor1[keep_time_mask].copy()
+        self.monitor2 = self.monitor2[keep_time_mask].copy()
+        self.time_jitter = self.time_jitter[keep_time_mask].copy()
+        self.laser_mask = self.laser_mask[keep_time_mask].copy()
+        if bool(self.delay_scan) and self.delays is not None:
+            self.delays = self.delays[keep_time_mask].copy()
 
     def _reduce(self):
         """Build raw_delays dict (unmorphed) from the reduced arrays."""
